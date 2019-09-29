@@ -1,2 +1,205 @@
-test
+Forberedelser
 
+"""De tre miksede lydfilene importeres. Her brukes ferdiglagede funksjoner fra det tilldelte biblioteket wav_file_loader.
+Data fra lydfilene returneres som en matrise."""
+
+import numpy as np
+from wav_file_loader import read_wavefiles
+from scipy.linalg import fractional_matrix_power
+
+paths = ['audio/mix_1.wav', 'audio/mix_2.wav', 'audio/mix_3.wav']
+data, sampling_rate = read_wavefiles(paths)
+num_signals = data.shape[0]
+
+paths2 = ['audio/everhadadream.wav', 'audio/kulsang.wav', 'audio/LangemannsSang.wav']
+data2, sampling_rate2 = read_wavefiles(paths2)
+num_signals2 = data2.shape[0]
+
+
+"""Funksjonen normaliserer lydsignalenes volum, på denne måten får de tre signalene omtrent samme lydstyrke."""
+def normalize_audio(data):
+    """Skalér amplituden slik at max(data[i]) == 1"""
+    abs_data = np.absolute(data)
+    maximums = np.amax(abs_data,1)
+    # Divide each row by a different vector element:
+    data = data / maximums.reshape((3,1))
+    return data 
+
+data = normalize_audio(data)
+data2 = normalize_audio(data2)
+
+"""Her kan de opplastede lydklippene spilles av"""
+import IPython.display as ipd
+
+ipd.display(ipd.Audio(data[0,:], rate=sampling_rate))
+ipd.display(ipd.Audio(data[1,:], rate=sampling_rate))
+ipd.display(ipd.Audio(data[2,:], rate=sampling_rate))
+
+ipd.display(ipd.Audio(data2[0,:], rate=sampling_rate2))
+ipd.display(ipd.Audio(data2[1,:], rate=sampling_rate2))
+ipd.display(ipd.Audio(data2[2,:], rate=sampling_rate2))
+
+
+Miksing av filene
+
+
+def normalize_rowsums(A):
+    """Divide each row in A by its sum.
+    
+    The sum of each row in the result is 1.0."""
+    the_sum = np.sum(A,1)
+    A = A / the_sum.reshape((3,1))
+    return A
+
+def random_mixing_matrix(signals, observations):
+    """ Creates a random matrix
+    
+    Each element is a small positive number, not too close to 0.
+    (1/11, 5/7).
+    """
+    A = 0.25 + np.random.rand(observations, signals)
+    return normalize_rowsums(A)
+
+A = random_mixing_matrix(num_signals, num_signals)
+data_mixed = normalize_audio(A @ data2)
+
+import IPython.display as ipd
+
+ipd.display(ipd.Audio(data_mixed[0,:], rate=sampling_rate2))
+ipd.display(ipd.Audio(data_mixed[1,:], rate=sampling_rate2))
+ipd.display(ipd.Audio(data_mixed[2,:], rate=sampling_rate2))
+
+Preprossesering
+
+def center_rows(Z):
+    """ Tar in en (3 x N)-matrise Z og returnerer en sentrert (3 x N)-matrise, samt den vertikale vektoren mus, der hvert element
+    er gjennomsnittet til radene 1, 2, ..., N. """
+    mus = np.mean(Z, axis=1)
+    Zc = Z - mus.reshape((3,1))
+    return Zc, mus
+
+
+def whiten_rows(Z):
+    """ Funksjonen tar inn en sentrert matrise Z, og returnerer Z 'whitened', her Zw, hvor Zw = T * Z """
+    C = np.cov(Z)  #lager kovariansmatrise C
+    # De to neste trinnene beregner T (den inverse kvadratroten av C).
+    U, S, _ = np.linalg.svd(C, full_matrices=False)
+    T  = U @ np.diag(1 / np.sqrt(S)) @ U.T
+    Zw = T @ Z
+    return Zw
+
+
+Hovediterasjon
+
+from sklearn.preprocessing import normalize
+
+def normalize_rownorms(Z):
+    """Funksjonen tar inn en matrise Z og returnerer matrisen Zn, hvor hver rad er normalisert."""
+    Zn = normalize(Z, axis=1, norm='l1') # Skalerer hver rad i Z med normen
+    return Zn
+
+def decorrelate_weights(W):
+    """Funksjonen ortogonaliserer (dekorrelerer) miksematrisen W. 
+    Inputmatrisen W projiseres ned på en ortogonal matrise gjennom transformasjonen (WW^T)^{-1/2}W. 
+    Funksjonen returner den projiserte W-matrisen."""
+    return fractional_matrix_power(W @ W.T, -1/2) @ W
+    
+def G_k (s): # Her brukes Kurtosefunksjonen G som mål på ikke-Gaussiskhet
+    G = 4*s**3 
+    G_derrivative = 12*s**2 # Kurtosens deriverte
+    return G, G_derrivative
+
+def G_n (u): # Her brukes negentropyfunskjonen 
+    G = u * np.exp(-u**2/2)
+    G_derrivative = (1 - u**2) * np.exp(-u**2/2)
+    return G, G_derrivative
+ 
+
+
+def update_W(W_k, Zcw, f):
+    
+    """Beregner W_k+1 fra W_k.
+    Input er en tifeldig (3 x 3)-matrise W_k, den sentrerte, 'whitened' (3 x N)-datamatrisen Zcw
+    (kalt tilde{x} i innledningen) og kurtose- eller negentropyfunksjonen f. Funksjonen returnerer en optimalisert og ortogonalisert matrise W_{k+1}. """
+    
+    s = W_k @ Zcw
+    G, G_derrivative = f(s)
+    N = len(G[0])
+    E_G = np.mean(G_derrivative, axis=1) # Finner forventningsverdien til den deriverte av kurtosen
+    
+    W_p = G @ Zcw.T/N - np.diag(E_G) @ W_k # Estimerer en matrise med større ikke-Gaussiskhet
+    W_n = normalize_rownorms(W_p)
+    W_no = decorrelate_weights(W_n)
+    return W_no
+
+def measure_of_convergence(W1, W2):
+    """Tar inn to matriser (skal brukes til å ta inn matrisen fra forrige og nåværende iterasjon) og returnerer feilestimatet."""   
+    delta = np.amax(1 - np.absolute(np.sum(W1*W2, axis=1)))
+    return delta
+
+
+import warnings
+
+
+def fast_ICA(Z, signals_to_find, f, tol=1e-12, max_iter=1000):
+    """Funksjonen bruker funksjonene ovenfor til å behandle lydfilene, manipulere matriser,
+    og optimere miksematrisen W gjennom iterasjon.
+
+    Input: Z: ubehandlet data fra lydfilene
+           signals_to_find: antall lydkilder, i vårt tilfelle alltid 3
+           tol: toleranse for feilestimat
+           max_iter: maksimalt antall iterasjoner dersom konvergens ikke oppnås
+           f: kurtose- eller negentropyfunksjonen
+    Output: Zcw: de separerte signalene
+            W: den ferdigbehandlede miksematrisen W (3x3)
+            Andre variabler, f. eks. antall iterasjoner, kan også hentes ut.
+    """
+    Zc, mus = center_rows(Z)
+    Zcw = whiten_rows(Zc)
+    W_0 = np.random.rand(3, 3) # Gir W_0 = W tilfeldig initialverdi 
+    normalize_rownorms(W_0)    
+    # Initialiserer variabler til bruk i while-løkka:
+    W = update_W(W_0, Zcw, f)
+    delta = measure_of_convergence(W_0, W)
+    number_of_iterations = 0
+    while delta > tol and number_of_iterations < max_iter:
+        W_new = update_W(W, Zcw, f)
+        delta = measure_of_convergence(W, W_new)
+        W = W_new
+        number_of_iterations += 1
+    return number_of_iterations, W @ Zcw
+    
+    
+iterations, signals = fast_ICA(data, num_signals, G_k) #kaller funksjonen med data fra lydfilene
+print("Kurtosefunksjonen. Antall iterasjoner: ", iterations)
+
+import IPython.display as ipd
+
+"""Spiller av de separerte lydsignalene:"""
+
+ipd.display(ipd.Audio(signals[0,:], rate=sampling_rate))
+ipd.display(ipd.Audio(signals[1,:], rate=sampling_rate))
+ipd.display(ipd.Audio(signals[2,:], rate=sampling_rate))
+
+
+iterations, signals = fast_ICA(data, num_signals, G_n) #kaller funksjonen med data fra lydfilene
+print("Negentropyfunksjonen. Antall iterasjoner: ", iterations)
+
+
+"""Spiller av de separerte lydsignalene:"""
+
+ipd.display(ipd.Audio(signals[0,:], rate=sampling_rate))
+ipd.display(ipd.Audio(signals[1,:], rate=sampling_rate))
+ipd.display(ipd.Audio(signals[2,:], rate=sampling_rate))
+
+
+
+iterations, signals = fast_ICA(data2, num_signals, G_n) #kaller funksjonen med data fra lydfilene
+print("Negentropyfunksjonen med egne klipp. Antall iterasjoner: ", iterations)
+
+
+"""Spiller av de separerte lydsignalene:"""
+
+ipd.display(ipd.Audio(signals[0,:], rate=sampling_rate2))
+ipd.display(ipd.Audio(signals[1,:], rate=sampling_rate2))
+ipd.display(ipd.Audio(signals[2,:], rate=sampling_rate2))
